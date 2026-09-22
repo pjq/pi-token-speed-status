@@ -11,11 +11,11 @@
     "footer"
   ],
   "license": "MIT",
-  "author": "pjq",
+  "author": "Jianqing Peng",
   "homepage": "https://github.com/pjq/pi-token-speed-status#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/pjq/pi-token-speed-status.git"
+    "url": "git+ssh://git@github.com/pjq/pi-token-speed-status.git"
   },
   "bugs": {
     "url": "https://github.com/pjq/pi-token-speed-status/issues"
