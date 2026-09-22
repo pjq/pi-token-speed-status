@@ -14,8 +14,7 @@
  * During context compaction it shows "⚡ compacting…", then the
  * compaction's own speed ("⚡ compact ✓ 1234 tok / 25.3s = 48.8 tok/s").
  *
- * Coexists with pi-token-speed (separate footer status key); disable
- * pi-token-speed if you don't want both in the footer.
+ * Install: pi install git:github.com/pjq/pi-token-speed-status
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
