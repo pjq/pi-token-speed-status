@@ -1,55 +1,95 @@
 /**
- * Token Speed (real-time + 10-second average)
+ * pi-token-speed-status
  *
- * Shows two throughput numbers in the footer while the assistant streams:
+ * A pi footer status extension showing token throughput:
  *   ⚡ TPS 24.3 tok/s 18.2 tok/s (10s)
  *
- * - "now"  = tokens in the last ~2s (true real-time throughput)
- * - "10s"  = tokens generated in the last 10s (stable average; catches
- *            slowdowns that a short window smooths over)
+ * - first value: tokens in the last ~2s (true real-time throughput)
+ * - (10s) value: tokens generated in the last 10s (stable average)
+ * - color-coded with the pi-token-speed palette (red <15, orange <30,
+ *   green <45, cyan ≥45 tok/s)
+ * - turn total when a turn ends: "⚡ TPS ✓ 4321 tok / 38.2s = 113.1 tok/s (turn)"
+ * - context compaction: "⚡ compacting…" while it runs, then
+ *   "⚡ compact ✓ 1234 tok / 25.3s = 48.8 tok/s"
+ * - the footer is never blanked — the last known values stay visible across
+ *   tool pauses, compaction, and session rebinds
  *
- * The 10s window resets per request so tool-execution gaps (bash, file
- * reads, ...) don't drag the average down. When the turn ends the footer
- * shows the turn total: "✓ 4321 tok / 38.2s = 113 tok/s (turn)".
- * During context compaction it shows "⚡ compacting…", then the
- * compaction's own speed ("⚡ compact ✓ 1234 tok / 25.3s = 48.8 tok/s").
- *
- * Install: pi install git:github.com/pjq/pi-token-speed-status
+ * Install: pi install npm:pi-token-speed-status
  */
 
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type {
+	AgentEndEvent,
+	ExtensionAPI,
+	ExtensionContext,
+	MessageEndEvent,
+	MessageStartEvent,
+	MessageUpdateEvent,
+	SessionBeforeCompactEvent,
+	SessionCompactEvent,
+	SessionCompactFailedEvent,
+	SessionStartEvent,
+	ThemeColor,
+	ToolResultEvent,
+} from "@earendil-works/pi-coding-agent";
 
-const REAL_WINDOW_MS = 2000;
-const MIN_REAL_SPAN_MS = 500; // avoid dividing by a tiny span after burst flushes
-const RECENT_WINDOW_MS = 10_000;
-const MIN_RECENT_SPAN_MS = 1000;
-const UPDATE_INTERVAL_MS = 100; // footer render throttle (pi-token-speed default: immediate; 100ms = snappy but bounded)
-const COMPACTION_THRESHOLD = 256;
+// Streaming content blocks as observed in message_update events. The SDK's
+// public Content union models complete blocks (text | thinking | toolCall);
+// delta variants (text_delta, thinking_delta, toolcall_delta) are emitted
+// during streaming but are not part of that union, so they are typed here.
+interface StreamBlock {
+	type: string;
+	name?: string;
+	/** string for text/thinking deltas; partial args object for toolcall deltas. */
+	delta?: any;
+}
+
+// ---------------------------------------------------------------------------
+// Tuning
+// ---------------------------------------------------------------------------
+
+export const REAL_WINDOW_MS = 2_000;
+export const MIN_REAL_SPAN_MS = 500; // avoid dividing by a tiny span after burst flushes
+export const RECENT_WINDOW_MS = 10_000;
+export const MIN_RECENT_SPAN_MS = 1_000;
+export const UPDATE_INTERVAL_MS = 100; // footer render throttle (snappy but bounded)
+export const COMPACTION_THRESHOLD = 256; // bound event-array growth
 
 // Speed tiers + truecolor palette from pi-token-speed (15/30/45, hex colors)
-const SLOW_HEX = "#ff4444";
-const MEDIUM_HEX = "#ffaa00";
-const FAST_HEX = "#00ff88";
-const BLAZING_HEX = "#44ddff";
+export const SLOW_HEX = "#ff4444";
+export const MEDIUM_HEX = "#ffaa00";
+export const FAST_HEX = "#00ff88";
+export const BLAZING_HEX = "#44ddff";
 
-const hexToRgb = (hex: string): [number, number, number] => [1, 3, 5].map((i) =>
-	parseInt(hex.slice(i, i + 2), 16),
-) as [number, number, number];
+/** Wrap text in an 8-bit truecolor SGR sequence derived from a #rrggbb hex. */
+export const hexToRgb = (hex: string): [number, number, number] =>
+	[1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16)) as [number, number, number];
 
-const colorize = (text: string, tps: number): string => {
+/** Color a token-rate value using the pi-token-speed palette. */
+export const colorize = (text: string, tps: number): string => {
 	const hex = tps < 15 ? SLOW_HEX : tps < 30 ? MEDIUM_HEX : tps < 45 ? FAST_HEX : BLAZING_HEX;
 	const [r, g, b] = hexToRgb(hex);
 	return `\x1b[38;2;${r};${g};${b}m${text}\x1b[39m`;
 };
 
-const TOKEN_GENERATION_TOOLS = new Set(["edit", "write"]);
+// ---------------------------------------------------------------------------
+// Sliding window
+// ---------------------------------------------------------------------------
 
-interface TokEvent {
+export interface TokEvent {
 	time: number;
 	tokens: number;
 }
 
-class Window {
+/**
+ * Sliding time window over token-production events.
+ *
+ * - `getTps(now)` averages tokens over the window, clamped to `minSpanMs`.
+ * - If every token arrived in a single timestamped burst (e.g. after a stall),
+ *   the span is extended back to the previous event so the flush isn't
+ *   reported as infinitely fast (same heuristic as pi-token-speed).
+ * - Events beyond `COMPACTION_THRESHOLD` are pruned once they leave the window.
+ */
+export class Window {
 	events: TokEvent[] = [];
 	private head = 0;
 
@@ -58,9 +98,9 @@ class Window {
 		private readonly minSpanMs: number,
 	) {}
 
-	record(tokens: number): void {
+	record(tokens: number, now = Date.now()): void {
 		if (tokens <= 0) return;
-		this.events.push({ time: Date.now(), tokens });
+		this.events.push({ time: now, tokens });
 		if (this.head >= COMPACTION_THRESHOLD) this.compact();
 	}
 
@@ -75,7 +115,6 @@ class Window {
 		for (let i = this.head; i < this.events.length; i++) tokens += this.events[i].tokens;
 		if (tokens === 0) return 0;
 
-		// All tokens in one burst after a stall? Include the gap in the span.
 		let spanStart = this.events[this.head].time;
 		const allSame = this.events[this.head].time === this.events[this.events.length - 1].time;
 		if (allSame && this.head > 0) spanStart = this.events[this.head - 1].time;
@@ -95,6 +134,48 @@ class Window {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
+
+export const formatRate = (text: string): string => `${text} tok/s`;
+
+/** Dim "⚡" + dim "TPS" prefix plus the two colorized rates. */
+export function formatLine(
+	fg: (color: ThemeColor, text: string) => string,
+	tpsNow: number,
+	tpsAvg: number,
+): string {
+	return (
+		`${fg("accent", "⚡")} ${fg("dim", "TPS")} ` +
+		`${colorize(formatRate(tpsNow.toFixed(1)), tpsNow)} ` +
+		`${colorize(formatRate(tpsAvg.toFixed(1)), tpsAvg)}${fg("dim", " (10s)")}`
+	);
+}
+
+export const PLACEHOLDER_LINE = (fg: (color: ThemeColor, text: string) => string): string =>
+	`${fg("accent", "⚡")} ${fg("dim", "TPS — — tok/s — tok/s (10s)")}`;
+
+// ---------------------------------------------------------------------------
+// Extension
+// ---------------------------------------------------------------------------
+
+/** Best-effort output-token count for a streaming assistant message. */
+function streamTokens(message: any, lastReported: number): { tokens: number; next: number } {
+	let tokens = 0;
+	let next = lastReported;
+	const usage = message?.content?.[0]?.usage;
+	if (usage && typeof usage.output === "number") {
+		if (usage.output > lastReported) {
+			tokens += usage.output - lastReported;
+			next = usage.output;
+		}
+	} else if (typeof message?.content?.[0]?.text === "string") {
+		tokens += message.content[0].text.length / 4; // rough estimate when no usage is reported
+	}
+	return { tokens, next };
+}
+
 export default function (pi: ExtensionAPI) {
 	const real = new Window(REAL_WINDOW_MS, MIN_REAL_SPAN_MS);
 	const recent = new Window(RECENT_WINDOW_MS, MIN_RECENT_SPAN_MS);
@@ -106,29 +187,22 @@ export default function (pi: ExtensionAPI) {
 	let lastReported: number | undefined;
 	let lastLine: string | undefined; // last rendered values; footer is never blanked
 	let turnStart = 0;
+	let compactStart = 0;
 
 	const render = (forced = false) => {
 		if (!ctx) return;
-		const theme = ctx.ui.theme;
+		const fg = ctx.ui.theme.fg.bind(ctx.ui.theme);
 		if (!streaming) {
 			// Keep the last known values visible (tool pause, compaction,
 			// session rebind) instead of blanking the footer.
-			const placeholder =
-				lastLine ??
-				`${theme.fg("accent", "⚡")} ${theme.fg("dim", "TPS — — tok/s — tok/s (10s)")}`;
-			ctx.ui.setStatus("token-speed", placeholder);
+			ctx.ui.setStatus("token-speed", lastLine ?? PLACEHOLDER_LINE(fg));
 			return;
 		}
 		const now = Date.now();
 		if (!forced && now - lastRender < UPDATE_INTERVAL_MS) return;
 		lastRender = now;
 
-		const tpsNow = real.getTps(now);
-		const tpsAvg = recent.getTps(now);
-		const text =
-			`${theme.fg("accent", "⚡")} ${theme.fg("dim", "TPS")} ` +
-			`${colorize(`${tpsNow.toFixed(1)} tok/s`, tpsNow)} ` +
-			`${colorize(`${tpsAvg.toFixed(1)} tok/s`, tpsAvg)}${theme.fg("dim", " (10s)")}`;
+		const text = formatLine(fg, real.getTps(now), recent.getTps(now));
 		lastLine = text;
 		ctx.ui.setStatus("token-speed", text);
 	};
@@ -140,56 +214,38 @@ export default function (pi: ExtensionAPI) {
 		render(forced);
 	};
 
-	pi.on("session_start", async (_event, c) => {
+	// A new assistant message (or stream re-start on the same message) begins a
+	// fresh generation segment.
+	pi.on("message_start", (event: MessageStartEvent, c: ExtensionContext) => {
 		ctx = c;
-		turnStart = Date.now();
-		render(true); // restore the footer after a session replacement (compaction/resume)
-	});
-
-	pi.on("message_start", (event: any, c: ExtensionContext) => {
-		ctx = c;
-		if (event.message?.role === "user") {
-			turnStart = Date.now();
-			recent.reset(); // new request: start the 10s average fresh
-		}
 		if (event.message?.role === "assistant") {
-			paused = false; // a tool finished, the model is generating again
-		}
-	});
-
-	pi.on("message_update", (event: any, c: ExtensionContext) => {
-		ctx = c;
-		const ev = event.assistantMessageEvent;
-		if (!ev || paused) return;
-		const type = ev.type as string;
-
-		if (type === "text_start" || type === "thinking_start" || type === "toolcall_start") {
-			paused = false;
 			if (!streaming) {
 				streaming = true;
-				recent.reset();
-				lastRender = 0; // first delta of a new stream must paint immediately,
-				// even if the previous render was <500ms ago (fast responses)
+				paused = false;
+				turnStart = Date.now();
+				lastRender = 0; // first render of a new stream must not be throttled
+				recent.reset(); // new request: start the 10s average fresh
 			}
-			lastReported = undefined;
-			return;
+			lastReported = event.message.usage?.output ?? 0;
+			render(true);
 		}
+	});
 
-		// Provider-reported cumulative output is authoritative when present;
-		// fall back to a chars/4 estimate (local providers often omit it).
-		let tokens = 0;
-		if (type === "text_delta" || type === "thinking_delta") {
-			const reported: number | undefined = ev.partial?.usage?.output;
-			if (typeof reported === "number" && reported > 0) {
-				tokens = reported - (lastReported ?? reported);
-				lastReported = reported;
-			} else if (typeof ev.delta === "string") {
-				tokens = ev.delta.length / 4;
-			}
-		} else if (type === "toolcall_delta") {
-			const call = ev.partial?.content?.[ev.contentIndex ?? 0];
-			if (TOKEN_GENERATION_TOOLS.has(call?.name ?? "")) {
-				tokens = typeof ev.delta === "string" ? ev.delta.length / 4 : 0;
+	pi.on("message_update", (event: MessageUpdateEvent, c: ExtensionContext) => {
+		ctx = c;
+		if (paused || !streaming) return;
+		if (event.message?.role !== "assistant") return;
+
+		let { tokens, next } = streamTokens(event.message, lastReported ?? 0);
+		lastReported = next;
+
+		// Text, thinking, and tool-call args (bash commands, file writes, ...) —
+		// all are generated output; delta blocks aren't in the SDK's Content union.
+		for (const block of (event.message?.content ?? []) as StreamBlock[]) {
+			if (block.type === "text_delta" || block.type === "thinking_delta") {
+				tokens += block.delta.length / 4;
+			} else if (block.type === "toolcall_delta" && block.delta?.args != null) {
+				tokens += JSON.stringify(block.delta.args).length / 4;
 			}
 		}
 
@@ -200,12 +256,17 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 
-	pi.on("message_end", (event: any, c: ExtensionContext) => {
+	pi.on("message_end", (event: MessageEndEvent, c: ExtensionContext) => {
 		ctx = c;
-		if (event.message?.role === "assistant") render(true); // final values for this stream
+		if (event.message?.role === "assistant") {
+			// The stream for this message is done; the turn continues until
+			// agent_end (there may be more assistant messages after tools).
+			lastReported = undefined;
+			render(true);
+		}
 	});
 
-	pi.on("tool_result", (event: any, c: ExtensionContext) => {
+	pi.on("tool_result", (_event: ToolResultEvent, c: ExtensionContext) => {
 		ctx = c;
 		// Model is idle while the tool runs — pause both windows.
 		streaming = false;
@@ -213,12 +274,23 @@ export default function (pi: ExtensionAPI) {
 		render(true);
 	});
 
-	let compactStart = 0;
+	pi.on("session_start", (event: SessionStartEvent, c: ExtensionContext) => {
+		ctx = c;
+		// On startup and on rebind (/new, /resume, compaction) render the
+		// placeholder / last values so the footer is never blank.
+		lastRender = 0;
+		render(true);
+	});
+
+	pi.on("session_shutdown", (_event: unknown, c: ExtensionContext) => {
+		ctx = c;
+		ctx.ui.setStatus("token-speed", undefined);
+	});
 
 	// Context compaction runs as an internal LLM call (no per-token message
 	// events), so live TPS isn't possible — but we show an indicator while it
 	// runs and its overall speed when it finishes.
-	pi.on("session_before_compact", (_event: any, c: ExtensionContext) => {
+	pi.on("session_before_compact", (_event: SessionBeforeCompactEvent, c: ExtensionContext) => {
 		ctx = c;
 		streaming = false;
 		paused = true;
@@ -227,7 +299,7 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.setStatus("token-speed", `${ctx.ui.theme.fg("accent", "⚡")} ${ctx.ui.theme.fg("dim", "compacting…")}`);
 	});
 
-	pi.on("session_compact", (event: any, c: ExtensionContext) => {
+	pi.on("session_compact", (event: SessionCompactEvent, c: ExtensionContext) => {
 		ctx = c;
 		paused = false;
 		if (!compactStart) return;
@@ -241,18 +313,18 @@ export default function (pi: ExtensionAPI) {
 		lastLine =
 			`${ctx.ui.theme.fg("accent", "⚡")} compact ${ctx.ui.theme.fg("success", "✓")} ` +
 			`${ctx.ui.theme.fg("dim", `${Math.round(tok)} tok / ${secs.toFixed(1)}s = `)}` +
-			colorize(`${tps.toFixed(1)} tok/s`, tps);
+			colorize(formatRate(tps.toFixed(1)), tps);
 		ctx.ui.setStatus("token-speed", lastLine);
 	});
 
-	pi.on("session_compact_failed", (_event: any, c: ExtensionContext) => {
+	pi.on("session_compact_failed", (_event: SessionCompactFailedEvent, c: ExtensionContext) => {
 		ctx = c;
 		paused = false;
 		compactStart = 0;
 		render(true); // back to placeholder / last values
 	});
 
-	pi.on("agent_end", (event: any, c: ExtensionContext) => {
+	pi.on("agent_end", (event: AgentEndEvent, c: ExtensionContext) => {
 		ctx = c;
 		const total = (event.messages ?? []).reduce(
 			(acc: number, m: any) => acc + (m.role === "assistant" ? (m.usage?.output ?? 0) : 0),
