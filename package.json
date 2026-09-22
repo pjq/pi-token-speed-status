@@ -1,0 +1,13 @@
+{
+  "name": "pi-token-speed-status",
+  "version": "0.1.0",
+  "description": "pi footer status: real-time + 10s token speed, compaction speed, turn totals",
+  "keywords": ["pi-package"],
+  "license": "MIT",
+  "pi": {
+    "extensions": ["extensions"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}
