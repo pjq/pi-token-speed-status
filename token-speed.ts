@@ -245,13 +245,27 @@ export default function (pi: ExtensionAPI) {
 		let { tokens, next } = streamTokens(event.message, lastReported ?? 0);
 		lastReported = next;
 
-		// Text, thinking, and tool-call args (bash commands, file writes, ...) —
-		// all are generated output; delta blocks aren't in the SDK's Content union.
-		for (const block of (event.message?.content ?? []) as StreamBlock[]) {
-			if (block.type === "text_delta" || block.type === "thinking_delta") {
-				tokens += block.delta.length / 4;
-			} else if (block.type === "toolcall_delta" && block.delta?.args != null) {
-				tokens += JSON.stringify(block.delta.args).length / 4;
+		// Pi exposes the actual provider stream event separately from the
+		// accumulated message. In particular, bash/write/edit arguments arrive
+		// as a toolcall_delta string here.
+		const streamEvent = event.assistantMessageEvent;
+		if (streamEvent && "delta" in streamEvent && typeof streamEvent.delta === "string") {
+			if (streamEvent.type === "text_delta" || streamEvent.type === "thinking_delta" || streamEvent.type === "toolcall_delta") {
+				tokens += streamEvent.delta.length / 4;
+			}
+		}
+
+		// Compatibility fallback for runtimes that expose delta blocks on the
+		// message itself rather than through assistantMessageEvent.
+		if (!streamEvent && tokens === 0) {
+			for (const block of (event.message?.content ?? []) as StreamBlock[]) {
+				if (block.type === "text_delta" || block.type === "thinking_delta") {
+					tokens += typeof block.delta === "string" ? block.delta.length / 4 : 0;
+				} else if (block.type === "toolcall_delta" && block.delta != null) {
+					tokens += typeof block.delta === "string"
+						? block.delta.length / 4
+						: JSON.stringify(block.delta).length / 4;
+				}
 			}
 		}
 

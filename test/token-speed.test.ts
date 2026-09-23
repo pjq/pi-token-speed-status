@@ -209,6 +209,21 @@ describe("extension", () => {
 		expect(line).toContain("tok/s"); // recorded → footer updated
 	});
 
+	it("counts real pi tool-call deltas from assistantMessageEvent", () => {
+		const { pi, ctx } = setup();
+		pi.fire("message_start", { type: "message_start", message: msg("assistant") }, ctx);
+		pi.fire(
+			"message_update",
+			{
+				type: "message_update",
+				message: msg("assistant"),
+				assistantMessageEvent: { type: "toolcall_delta", contentIndex: 0, delta: '{"command":"printf hello"}', partial: msg("assistant") },
+			},
+			ctx,
+		);
+		const line = ctx.set.mock.calls.at(-1)![1] as string;
+		expect(line).toContain("tok/s");
+	});
 	it("pauses during tool execution and resumes on the next assistant message", () => {
 		const { pi, ctx } = setup();
 		pi.fire("message_start", { type: "message_start", message: msg("assistant") }, ctx);
