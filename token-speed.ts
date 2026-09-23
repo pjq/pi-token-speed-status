@@ -198,6 +198,12 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.setStatus("token-speed", lastLine ?? PLACEHOLDER_LINE(fg));
 			return;
 		}
+		// A message_start arrives before its first generated token. Do not
+		// replace the useful last line with a misleading 0.0/0.0 reading.
+		if (real.events.length === 0 && recent.events.length === 0) {
+			ctx.ui.setStatus("token-speed", lastLine ?? PLACEHOLDER_LINE(fg));
+			return;
+		}
 		const now = Date.now();
 		if (!forced && now - lastRender < UPDATE_INTERVAL_MS) return;
 		lastRender = now;

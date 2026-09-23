@@ -170,6 +170,13 @@ describe("extension", () => {
 		expect(last).toContain("— —");
 	});
 
+	it("does not show zero rates before the first token", () => {
+		const { pi, ctx } = setup();
+		pi.fire("message_start", { type: "message_start", message: msg("assistant") }, ctx);
+		const line = ctx.set.mock.calls.at(-1)![1] as string;
+		expect(line).toContain("— —");
+		expect(line).not.toContain("0.0 tok/s");
+	});
 	it("streams live TPS for text deltas and never blanks", () => {
 		const { pi, ctx } = setup();
 		pi.fire("message_start", { type: "message_start", message: msg("assistant") }, ctx);
