@@ -239,6 +239,17 @@ describe("extension", () => {
 		expect(ctx.set.mock.calls.length).toBeGreaterThan(before + 1);
 	});
 
+	it("does not recount accumulated message text", () => {
+		const { pi, ctx } = setup();
+		pi.fire("message_start", { type: "message_start", message: msg("assistant") }, ctx);
+		const usage = (output: number) => ({ input: 0, output, cacheRead: 0, cacheWrite: 0 });
+		pi.fire("message_update", { type: "message_update", message: { ...msg("assistant", [{ type: "text", text: "x" }]), usage: usage(100) } }, ctx);
+		pi.fire("message_update", { type: "message_update", message: { ...msg("assistant", [{ type: "text", text: "x".repeat(100_000) }]), usage: usage(100) } }, ctx);
+		const lines = ctx.set.mock.calls.map((call) => call[1] as string).filter((line) => line.includes("tok/s"));
+		// The second update has no new usage and no delta; its accumulated
+		// 100k-character message must not become another 25k tokens.
+		expect(lines.at(-1)).not.toContain("25000");
+	});
 	it("uses provider-reported cumulative usage as the token source", () => {
 		const { pi, ctx } = setup();
 		pi.fire("message_start", { type: "message_start", message: msg("assistant") }, ctx);

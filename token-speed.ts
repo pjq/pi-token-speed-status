@@ -160,22 +160,6 @@ export const PLACEHOLDER_LINE = (fg: (color: ThemeColor, text: string) => string
 // Extension
 // ---------------------------------------------------------------------------
 
-/** Best-effort output-token count for a streaming assistant message. */
-function streamTokens(message: any, lastReported: number): { tokens: number; next: number } {
-	let tokens = 0;
-	let next = lastReported;
-	const usage = message?.content?.[0]?.usage;
-	if (usage && typeof usage.output === "number") {
-		if (usage.output > lastReported) {
-			tokens += usage.output - lastReported;
-			next = usage.output;
-		}
-	} else if (typeof message?.content?.[0]?.text === "string") {
-		tokens += message.content[0].text.length / 4; // rough estimate when no usage is reported
-	}
-	return { tokens, next };
-}
-
 export default function (pi: ExtensionAPI) {
 	const real = new Window(REAL_WINDOW_MS, MIN_REAL_SPAN_MS);
 	const recent = new Window(RECENT_WINDOW_MS, MIN_RECENT_SPAN_MS);
@@ -188,6 +172,7 @@ export default function (pi: ExtensionAPI) {
 	let lastLine: string | undefined; // last rendered values; footer is never blanked
 	let turnStart = 0;
 	let compactStart = 0;
+	let sawStreamDelta = false;
 
 	const render = (forced = false) => {
 		if (!ctx) return;
@@ -233,6 +218,7 @@ export default function (pi: ExtensionAPI) {
 				recent.reset(); // new request: start the 10s average fresh
 			}
 			lastReported = event.message.usage?.output ?? 0;
+			sawStreamDelta = false;
 			render(true);
 		}
 	});
@@ -242,21 +228,33 @@ export default function (pi: ExtensionAPI) {
 		if (paused || !streaming) return;
 		if (event.message?.role !== "assistant") return;
 
-		let { tokens, next } = streamTokens(event.message, lastReported ?? 0);
-		lastReported = next;
-
-		// Pi exposes the actual provider stream event separately from the
-		// accumulated message. In particular, bash/write/edit arguments arrive
-		// as a toolcall_delta string here.
+		let tokens = 0;
 		const streamEvent = event.assistantMessageEvent;
-		if (streamEvent && "delta" in streamEvent && typeof streamEvent.delta === "string") {
-			if (streamEvent.type === "text_delta" || streamEvent.type === "thinking_delta" || streamEvent.type === "toolcall_delta") {
-				tokens += streamEvent.delta.length / 4;
+		const hasDelta =
+			streamEvent &&
+			"delta" in streamEvent &&
+			typeof streamEvent.delta === "string" &&
+			(streamEvent.type === "text_delta" || streamEvent.type === "thinking_delta" || streamEvent.type === "toolcall_delta");
+
+		if (hasDelta) {
+			// assistantMessageEvent.delta is incremental. Prefer it over usage
+			// here so a final cumulative usage report cannot double-count the
+			// already observed stream.
+			sawStreamDelta = true;
+			tokens = streamEvent.delta.length / 4;
+		} else if (!sawStreamDelta) {
+			// Some providers do not expose deltas but do expose cumulative
+			// output usage. Use only the incremental usage difference.
+			const output = event.message.usage?.output;
+			if (typeof output === "number") {
+				if (output > (lastReported ?? 0)) tokens = output - (lastReported ?? 0);
+				lastReported = Math.max(lastReported ?? 0, output);
 			}
 		}
 
 		// Compatibility fallback for runtimes that expose delta blocks on the
-		// message itself rather than through assistantMessageEvent.
+		// message itself rather than through assistantMessageEvent. Never use
+		// accumulated message text as a per-update count.
 		if (!streamEvent && tokens === 0) {
 			for (const block of (event.message?.content ?? []) as StreamBlock[]) {
 				if (block.type === "text_delta" || block.type === "thinking_delta") {
@@ -282,6 +280,7 @@ export default function (pi: ExtensionAPI) {
 			// The stream for this message is done; the turn continues until
 			// agent_end (there may be more assistant messages after tools).
 			lastReported = undefined;
+			sawStreamDelta = false;
 			render(true);
 		}
 	});
