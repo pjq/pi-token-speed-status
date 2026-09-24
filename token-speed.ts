@@ -216,7 +216,7 @@ export default function (pi: ExtensionAPI) {
 	const stopStreaming = (forced = false) => {
 		streaming = false;
 		paused = false;
-		recent.reset(); // next turn starts a clean 10s average
+		turnStart = 0;
 		render(forced);
 	};
 
@@ -228,7 +228,7 @@ export default function (pi: ExtensionAPI) {
 			if (!streaming) {
 				streaming = true;
 				paused = false;
-				turnStart = Date.now();
+				if (!turnStart) turnStart = Date.now();
 				lastRender = 0; // first render of a new stream must not be throttled
 				recent.reset(); // new request: start the 10s average fresh
 			}

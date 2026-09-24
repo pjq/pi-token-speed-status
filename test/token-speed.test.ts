@@ -268,6 +268,25 @@ describe("extension", () => {
 		expect(line).toContain("4000 tok");
 	});
 
+	it("keeps the turn timer across tool calls", () => {
+		const { pi, ctx } = setup();
+		vi.setSystemTime(1_000);
+		pi.fire("message_start", { type: "message_start", message: msg("assistant") }, ctx);
+		pi.fire("tool_result", { type: "tool_result" }, ctx);
+		vi.setSystemTime(11_000);
+		pi.fire("message_start", { type: "message_start", message: msg("assistant") }, ctx);
+		pi.fire(
+			"agent_end",
+			{ type: "agent_end", messages: [
+				{ role: "assistant", usage: { output: 200 } },
+				{ role: "assistant", usage: { output: 200 } },
+			] },
+			ctx,
+		);
+		const line = ctx.set.mock.calls.at(-1)![1] as string;
+		expect(line).toContain("400 tok / 11.0s = 36.4 tok/s");
+		vi.useRealTimers();
+	});
 	it("shows the compaction indicator, then the compaction speed", () => {
 		const { pi, ctx } = setup();
 		pi.fire("session_before_compact", { type: "session_before_compact" }, ctx);
